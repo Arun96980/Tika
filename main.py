@@ -15,106 +15,76 @@ def extract_clean_text(file_path, tika_url="http://localhost:9998/rmeta/text"):
             response.raise_for_status()
             content_json = response.json()
             if content_json and isinstance(content_json, list):
-                main_text = content_json[0].get("X-TIKA:content", "")
-                return main_text.strip()
+                return content_json[0].get("X-TIKA:content", "").strip()
     except Exception as e:
         print(f"❌ Error extracting from {file_path}: {e}")
     return ""
 
-def clean_sentence(text):
-    return (
-        text.replace("", "")
-            .replace("•", "")
-            .replace("\n", " ")
-            .replace("\t", " ")
-            .replace("  ", " ")
-            .strip()
-    )
+def clean_sentence(sentence):
+    return sentence.replace('\n\n', ' ').replace('\n', ' ').replace('', '').strip()
 
 def split_into_sentences(text, nlp):
     doc = nlp(text)
-    return [sent.text.strip() for sent in doc.sents if sent.text.strip() and len(sent.text.strip()) > 5]
+    return [clean_sentence(sent.text) for sent in doc.sents if sent.text.strip() and len(sent.text.strip()) > 5]
 
-def process_and_index(pdf_dir, output_json, faiss_index_path, tika_url="http://localhost:9998/rmeta/text"):
+def process_resumes(pdf_dir, model, index_file="faiss.index", data_file="resume_data.json", tika_url="http://localhost:9998/rmeta/text"):
     results = []
-    supported_exts = ('.pdf', '.doc', '.docx', '.pptx', '.txt')
-    input_files = [f for f in os.listdir(pdf_dir) if f.lower().endswith(supported_exts)]
+    vectors = []
+    pdf_files = [f for f in os.listdir(pdf_dir) if f.lower().endswith(('.pdf', '.docx', '.pptx', '.txt'))]
 
-    if not input_files:
-        print(f"📂 No supported files found in {pdf_dir}")
-        return [], None
+    if not pdf_files:
+        print("📂 No supported files found.")
+        return
 
-    # Load NLP & model
     nlp = spacy.load("en_core_web_sm")
-    model = SentenceTransformer("all-MiniLM-L6-v2")
 
-    dim = 384
-    index = faiss.IndexFlatL2(dim)
-    metadata = []
-
-    for input_file in tqdm(input_files, desc="🔍 Processing Files"):
-        file_path = os.path.join(pdf_dir, input_file)
+    for pdf_file in tqdm(pdf_files, desc="🔍 Processing Files"):
+        file_path = os.path.join(pdf_dir, pdf_file)
         text = extract_clean_text(file_path, tika_url)
         if not text:
             continue
-
         sentences = split_into_sentences(text, nlp)
         for sentence in sentences:
-            cleaned = clean_sentence(sentence)
-            if cleaned:
-                embedding = model.encode(cleaned)
-                index.add(np.array([embedding]).astype("float32"))
-                metadata.append({
-                    "file": input_file,
-                    "sentence": cleaned
-                })
-                results.append({
-                    "file": input_file,
-                    "sentence": cleaned,
-                    "length": len(cleaned)
-                })
+            input_text = f"passage: {sentence}"
+            embedding = model.encode(input_text, normalize_embeddings=True)
+            vectors.append(embedding)
+            results.append({
+                "file": pdf_file,
+                "sentence": sentence,
+                "length": len(sentence)
+            })
 
-    # Save index and metadata
-    faiss.write_index(index, faiss_index_path)
-    with open("faiss_metadata.json", "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2, ensure_ascii=False)
+    if results:
+        dim = vectors[0].shape[0]
+        index = faiss.IndexFlatIP(dim)
+        index.add(np.array(vectors).astype("float32"))
 
-    with open(output_json, "w", encoding="utf-8") as out_f:
-        json.dump(results, out_f, indent=2, ensure_ascii=False)
+        faiss.write_index(index, index_file)
+        with open(data_file, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
 
-    print(f"\n✅ Indexed {len(results)} sentences. Saved metadata and FAISS index.")
-    return metadata, model
+        print(f"\n✅ Indexed {len(results)} sentences. Saved FAISS index and metadata.")
 
-def query_loop(model, faiss_index_path, metadata_path):
-    print("\n🔍 Ready for querying! Type your query below (or type 'exit' to quit):")
-    index = faiss.read_index(faiss_index_path)
-    with open(metadata_path, "r", encoding="utf-8") as f:
-        metadata = json.load(f)
+def search(query, model, index_file="faiss.index", data_file="resume_data.json", top_k=5):
+    query_vector = model.encode(f"query: {query}", normalize_embeddings=True).astype("float32")
+    index = faiss.read_index(index_file)
 
-    while True:
-        query = input("\n🔎 Enter query: ").strip()
-        if query.lower() in {"exit", "quit"}:
-            print("👋 Exiting search.")
-            break
+    with open(data_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-        embedding = model.encode(query).astype("float32").reshape(1, -1)
-        D, I = index.search(embedding, k=5)
-
-        print("\n🔗 Top 5 matches:")
-        for i, idx in enumerate(I[0]):
-            print(f"{i+1}. {metadata[idx]['sentence']} \n   ↪ from file: {metadata[idx]['file']}\n")
+    scores, indices = index.search(np.array([query_vector]), top_k)
+    print(f"\n🔍 Top {top_k} results for query: '{query}'\n")
+    for i, idx in enumerate(indices[0]):
+        print(f"{i+1}. {data[idx]['sentence']} (File: {data[idx]['file']})")
 
 if __name__ == "__main__":
-    pdf_directory = "resumes"                      # Folder with your resumes
-    output_file = "resumes_main_content.json"      # Sentences JSON
-    faiss_index_file = "resumes_index.faiss"       # FAISS index file
-    tika_server_url = "http://localhost:9998/rmeta/text"
+    model = SentenceTransformer("intfloat/e5-large")
 
-    # Step 1: Process and build index
-    metadata, model = process_and_index(
-        pdf_directory, output_file, faiss_index_file, tika_url=tika_server_url
-    )
+    pdf_directory = "resumes"
+    process_resumes(pdf_directory, model)
 
-    # Step 2: Query loop if successful
-    if metadata and model:
-        query_loop(model, faiss_index_file, "faiss_metadata.json")
+    while True:
+        query = input("\n🔎 Enter a search query (or 'exit' to quit): ")
+        if query.lower() == "exit":
+            break
+        search(query, model)
