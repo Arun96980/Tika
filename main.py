@@ -8,6 +8,8 @@ import hashlib
 from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
 from concurrent.futures import ThreadPoolExecutor
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
 
 # -----------------------------
 # Helper: Compute MD5 hash of a file
@@ -45,13 +47,34 @@ def split_into_sentences(text, nlp):
     return [clean_sentence(sent.text) for sent in doc.sents if sent.text.strip() and len(sent.text.strip()) > 5]
 
 # -----------------------------
+# Initialize Phi-2 for text generation (justification)
+phi_tokenizer = AutoTokenizer.from_pretrained("microsoft/phi-2")
+phi_model = AutoModelForCausalLM.from_pretrained("microsoft/phi-2", torch_dtype=torch.float32).eval()
+
+def generate_justification(query, sentence):
+    """
+    Generate a justification explaining why the resume sentence matches the query.
+    """
+    prompt = (
+        f"Job Query: {query}\n"
+        f"Resume Sentence: {sentence}\n\n"
+        "Explain concisely why this sentence is relevant to the job query."
+    )
+    inputs = phi_tokenizer(prompt, return_tensors="pt")
+    # Move inputs to CPU (if not already)
+    inputs = {k: v.to('cpu') for k, v in inputs.items()}
+    outputs = phi_model.generate(**inputs, max_new_tokens=100, do_sample=True, top_k=50)
+    justification = phi_tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return justification.strip()
+
+# -----------------------------
 def process_file(file, pdf_dir, nlp, model, tika_url):
     """
     Process a single file:
       - Compute its hash.
       - Extract text and split into sentences.
       - For each sentence, compute the embedding.
-    Returns a list of dictionaries (one per sentence) with file info and embedding.
+    Returns a list of dictionaries with file info and embedding.
     """
     file_path = os.path.join(pdf_dir, file)
     file_hash = compute_file_hash(file_path)
@@ -68,7 +91,7 @@ def process_file(file, pdf_dir, nlp, model, tika_url):
                 "file_hash": file_hash,
                 "sentence": sentence,
                 "length": len(sentence),
-                "embedding": embedding.tolist()  # temporary, for caching; not saved in final metadata
+                "embedding": embedding.tolist()  # temporary; will be removed from metadata
             })
     return results
 
@@ -82,10 +105,9 @@ def load_existing_metadata(metadata_file):
 # -----------------------------
 def process_all_files(pdf_dir, model, tika_url="http://localhost:9998/rmeta/text", metadata_file="faiss_metadata.json"):
     """
-    Process files concurrently and do incremental updates.
-    Loads existing metadata and builds a set of processed file hashes.
+    Process files concurrently and perform incremental indexing.
     Only processes files that are new or updated.
-    Returns a list of new sentence entries (including embedding vectors).
+    Returns a list of new sentence entries (with embeddings).
     """
     supported_exts = ('.pdf', '.doc', '.docx', '.pptx', '.txt')
     files = [f for f in os.listdir(pdf_dir) if f.lower().endswith(supported_exts)]
@@ -94,23 +116,20 @@ def process_all_files(pdf_dir, model, tika_url="http://localhost:9998/rmeta/text
         print("📂 No supported files found.")
         return []
     
-    # Load existing metadata and get processed file hashes
     existing_metadata = load_existing_metadata(metadata_file)
     processed_hashes = {entry["file_hash"] for entry in existing_metadata}
     
     nlp = spacy.load("en_core_web_sm")
     new_results = []
     
-    # Process files in parallel
     with ThreadPoolExecutor() as executor:
         futures = [executor.submit(process_file, file, pdf_dir, nlp, model, tika_url) for file in files]
         for future in tqdm(futures, desc="🔁 Processing Files"):
             file_results = future.result()
-            # Check the file hash in the first entry (if any)
             if file_results:
                 file_hash = file_results[0].get("file_hash")
                 if file_hash in processed_hashes:
-                    # Skip this file if already processed.
+                    print(f"\u23e9 Skipping cached: {file_results[0]['file']}")
                     continue
                 new_results.extend(file_results)
     return new_results
@@ -119,19 +138,16 @@ def process_all_files(pdf_dir, model, tika_url="http://localhost:9998/rmeta/text
 def build_incremental_index(new_results, model, index_file="faiss.index", metadata_file="faiss_metadata.json"):
     """
     Build or update the FAISS index with new_results.
-    new_results should have an "embedding" key containing the embedding vector.
-    Existing metadata is loaded and new_results are appended.
-    The embeddings from new_results are added to the FAISS index.
+    Loads existing metadata and appends new results.
+    Embeddings from new_results are added to the FAISS index.
     """
-    # Load existing metadata if available.
     existing_metadata = load_existing_metadata(metadata_file)
     all_metadata = existing_metadata.copy()
     
-    # Determine embedding dimension using model on a sample text.
+    # Determine embedding dimension using a sample text.
     sample_vec = model.encode("example", normalize_embeddings=True)
     dim = sample_vec.shape[0]
     
-    # If index file exists, load it; otherwise create a new one.
     if os.path.exists(index_file):
         index = faiss.read_index(index_file)
     else:
@@ -141,7 +157,6 @@ def build_incremental_index(new_results, model, index_file="faiss.index", metada
     for item in new_results:
         vec = np.array(item["embedding"]).astype("float32")
         new_vectors.append(vec)
-        # Remove embedding from metadata before saving.
         item.pop("embedding", None)
         all_metadata.append(item)
     
@@ -159,30 +174,35 @@ def build_incremental_index(new_results, model, index_file="faiss.index", metada
 def search(query, model, index_file="faiss.index", metadata_file="faiss_metadata.json", top_k=5):
     query_vec = model.encode(f"query: {query}", normalize_embeddings=True).astype("float32")
     index = faiss.read_index(index_file)
+    
     with open(metadata_file, "r", encoding="utf-8") as f:
         metadata = json.load(f)
-    # Using L2 distance index (IndexFlatL2): lower distance means better match.
+    
     distances, indices = index.search(np.array([query_vec]), top_k)
     print(f"\n🔍 Top {top_k} results for query: '{query}'\n")
     for i, idx in enumerate(indices[0]):
-        print(f"{i+1}. {metadata[idx]['sentence']} (File: {metadata[idx]['file']}), Distance: {distances[0][i]:.3f}")
+        result = metadata[idx]
+        justification = generate_justification(query, result["sentence"])
+        #print(f"{i+1}.  (File: {result['file']}), Distance: {distances[0][i]:.3f}")
+        print(f"   💬 Justification: {justification}\n")
 
 # -----------------------------
 if __name__ == "__main__":
+    # Initialize the E5-large model for embeddings.
     model = SentenceTransformer("intfloat/e5-large")
     
-    pdf_directory = "resumes"                      # Folder with your documents
+    pdf_directory = "resumes"                      # Folder with documents
     tika_url = "http://localhost:9998/rmeta/text"  # Tika endpoint
     index_file = "faiss.index"                     # FAISS index file
     metadata_file = "faiss_metadata.json"          # Metadata mapping file
-
-    # Process files and get new sentence results (skip already processed files)
+    
+    # Process files and get new sentence results (skipping cached files)
     new_results = process_all_files(pdf_directory, model, tika_url, metadata_file)
     
     # Build (or update) the FAISS index incrementally
     build_incremental_index(new_results, model, index_file, metadata_file)
     
-    # Query loop:
+    # Interactive query loop
     while True:
         query = input("\n🔎 Enter a search query (or 'exit' to quit): ").strip()
         if query.lower() == "exit":

@@ -1,6 +1,8 @@
-requests
-tqdm
-spacy
 faiss-cpu
 sentence-transformers
+spacy
+requests
+tqdm
 numpy
+transformers
+torch
