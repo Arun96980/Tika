@@ -45,7 +45,8 @@ def process_resumes(pdf_dir, output_json, tika_url="http://localhost:9998/rmeta/
     Process all PDF resumes, extract main content and split into cleaned sentences.
     """
     results = []
-    pdf_files = [f for f in os.listdir(pdf_dir) if f.lower().endswith('.pdf')]
+    supported_exts = ('.pdf', '.doc', '.docx', '.pptx', '.txt')
+    pdf_files = [f for f in os.listdir(pdf_dir) if f.lower().endswith(supported_exts)]
     
     if not pdf_files:
         print(f"📂 No PDF files found in {pdf_dir}")
