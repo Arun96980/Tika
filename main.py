@@ -63,35 +63,24 @@ def split_into_sentences(text, nlp):
 
 # -----------------------------
 # Initialize TinyLlama for text generation (justification)
-# Use the full model repo ID. Note that this model may still be heavy for CPU-only setups.
 tinyllama_tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 tinyllama_model = AutoModelForCausalLM.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0", torch_dtype=torch.float32).eval()
 
 def generate_justification(query, sentence):
-    try:
-
-
-        """
-        Generate a justification explaining why the resume sentence matches the query.
-        """
-        prompt = (
-            f"You are an AI assistant helping recruiters.\n"
-            f"Job Query: {query}\n"
-            f"Resume Sentence: {sentence}\n"
-            "Explain in 1-2 concise sentences why this sentence is relevant."
-        )
-        #inputs = tinyllama_tokenizer(prompt, return_tensors="pt")
-        #inputs = {k: v.to('cpu') for k, v in inputs.items()}
-        outputs = tinyllama_model.generate(**inputs, max_new_tokens=100, do_sample=True, top_k=50)
-        justification = tinyllama_tokenizer.decode(outputs[0], skip_special_tokens=True)
-        return justification.strip()
-    except Exception as e:
-        print(f"❌ Error generating justification: {e}")        
-        return "Justification generation failed."
-    except RuntimeError as e:                   
-        if "out of memory" in str(e):           
-            print("❌ Model is too large for this setup. Please use a smaller model or GPU.")
-            return "Justification generation failed due to memory constraints."
+    """
+    Generate a justification explaining why the resume sentence matches the query.
+    """
+    prompt = (
+        f"You are an AI assistant helping recruiters.\n"
+        f"Job Query: {query}\n"
+        f"Resume Sentence: {sentence}\n"
+        "Explain in 1-2 concise sentences why this sentence is relevant."
+    )
+    inputs = tinyllama_tokenizer(prompt, return_tensors="pt")
+    inputs = {k: v.to('cpu') for k, v in inputs.items()}
+    outputs = tinyllama_model.generate(**inputs, max_new_tokens=100, do_sample=True, top_k=50)
+    justification = tinyllama_tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return justification.strip()
 
 # -----------------------------
 def process_file(file, pdf_dir, model, tika_url, existing_sentence_hashes):
@@ -162,7 +151,6 @@ def process_all_files(pdf_dir, model, tika_url, metadata_file):
     processed_sentence_hashes = {entry.get("sentence_hash") for entry in existing_metadata if entry.get("sentence_hash")}
     
     new_results = []
-    # Use ThreadPoolExecutor to ensure the model is loaded only once.
     with ThreadPoolExecutor() as executor:
         futures = [executor.submit(process_file, file, pdf_dir, model, tika_url, processed_sentence_hashes) for file in files]
         for future in tqdm(futures, desc="🔁 Processing Files"):
@@ -208,20 +196,40 @@ def build_incremental_index(new_results, model, index_file, metadata_file):
         print("\n✅ No new sentences to process. Index remains unchanged.")
 
 # -----------------------------
-def search(query, model, index_file, metadata_file, top_k=5):
-    query_vec = model.encode(f"query: {query}", normalize_embeddings=True).astype("float32")
-    index = faiss.read_index(index_file)
-    
-    with open(metadata_file, "r", encoding="utf-8") as f:
-        metadata = json.load(f)
-    
-    distances, indices = index.search(np.array([query_vec]), top_k)
-    print(f"\n🔍 Top {top_k} results for query: '{query}'\n")
-    for i, idx in enumerate(indices[0]):
-        result = metadata[idx]
-        justification = generate_justification(query, result["sentence"])
-        print(f"{i+1}.  (File: {result['file']}), Distance: {distances[0][i]:.3f}")
-        print(f"   💬 Justification: {justification}\n")
+def aggregated_search(query, model, index_file, metadata_file, top_k_sentences=50, top_k_resumes=5):
+    try:
+        """
+        Retrieve the top sentences matching the query and aggregate by resume file.
+        Only display the aggregated resume results without generating justifications.
+        """
+        # Encode the query
+        query_vec = model.encode(f"query: {query}", normalize_embeddings=True).astype("float32")
+        index = faiss.read_index(index_file)
+        
+        with open(metadata_file, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+        
+        # Retrieve top sentences
+        distances, indices = index.search(np.array([query_vec]), top_k_sentences)
+        
+        # Group sentences by resume file
+        resume_scores = {}
+        for dist, idx in zip(distances[0], indices[0]):
+            if idx < 0 or idx >= len(metadata):
+                continue
+            item = metadata[idx]
+            file = item["file"]
+            similarity = 1 / (1 + dist)
+            resume_scores[file] = resume_scores.get(file, 0.0) + similarity
+        
+        # Sort by aggregated similarity score
+        sorted_resumes = sorted(resume_scores.items(), key=lambda x: x[1], reverse=True)
+        
+        print(f"\n🔍 Aggregated search results for query: '{query}'\n")
+        for rank, (file, score) in enumerate(sorted_resumes[:top_k_resumes], start=1):
+            print(f"{rank}. Resume File: {file} - Aggregated Score: {score:.3f}")
+    except Exception as e:
+        print(f"❌ Error during search: {e}")
 
 # -----------------------------
 if __name__ == "__main__":
@@ -250,9 +258,9 @@ if __name__ == "__main__":
     # Build (or update) the FAISS index incrementally
     build_incremental_index(new_results, model, args.index_file, args.metadata_file)
     
-    # Interactive query loop
+    # Interactive query loop with aggregated resume search
     while True:
         query = input("\n🔎 Enter a search query (or 'exit' to quit): ").strip()
         if query.lower() == "exit":
             break
-        search(query, model, args.index_file, args.metadata_file, top_k=5)
+        aggregated_search(query, model, args.index_file, args.metadata_file, top_k_sentences=50, top_k_resumes=5)
