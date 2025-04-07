@@ -1,5 +1,6 @@
 import os
 import json
+import argparse
 import requests
 import spacy
 import faiss
@@ -8,6 +9,17 @@ import hashlib
 from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
 from concurrent.futures import ThreadPoolExecutor
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+
+# -----------------------------
+# Lazy load spaCy model
+nlp_model = None
+def get_nlp():
+    global nlp_model
+    if nlp_model is None:
+        nlp_model = spacy.load("en_core_web_sm")
+    return nlp_model
 
 # -----------------------------
 # Helper: Compute MD5 hash of a file
@@ -20,6 +32,11 @@ def compute_file_hash(file_path):
     except Exception as e:
         print(f"Error computing hash for {file_path}: {e}")
     return hash_md5.hexdigest()
+
+# -----------------------------
+# Compute MD5 hash for a sentence to avoid re-embedding duplicates
+def compute_sentence_hash(sentence):
+    return hashlib.md5(sentence.encode("utf-8")).hexdigest()
 
 # -----------------------------
 def extract_clean_text(file_path, tika_url="http://localhost:9998/rmeta/text"):
@@ -45,31 +62,79 @@ def split_into_sentences(text, nlp):
     return [clean_sentence(sent.text) for sent in doc.sents if sent.text.strip() and len(sent.text.strip()) > 5]
 
 # -----------------------------
-def process_file(file, pdf_dir, nlp, model, tika_url):
+# Initialize TinyLlama for text generation (justification)
+# Use the full model repo ID. Note that this model may still be heavy for CPU-only setups.
+tinyllama_tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+tinyllama_model = AutoModelForCausalLM.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0", torch_dtype=torch.float32).eval()
+
+def generate_justification(query, sentence):
+    try:
+
+
+        """
+        Generate a justification explaining why the resume sentence matches the query.
+        """
+        prompt = (
+            f"You are an AI assistant helping recruiters.\n"
+            f"Job Query: {query}\n"
+            f"Resume Sentence: {sentence}\n"
+            "Explain in 1-2 concise sentences why this sentence is relevant."
+        )
+        #inputs = tinyllama_tokenizer(prompt, return_tensors="pt")
+        #inputs = {k: v.to('cpu') for k, v in inputs.items()}
+        outputs = tinyllama_model.generate(**inputs, max_new_tokens=100, do_sample=True, top_k=50)
+        justification = tinyllama_tokenizer.decode(outputs[0], skip_special_tokens=True)
+        return justification.strip()
+    except Exception as e:
+        print(f"❌ Error generating justification: {e}")        
+        return "Justification generation failed."
+    except RuntimeError as e:                   
+        if "out of memory" in str(e):           
+            print("❌ Model is too large for this setup. Please use a smaller model or GPU.")
+            return "Justification generation failed due to memory constraints."
+
+# -----------------------------
+def process_file(file, pdf_dir, model, tika_url, existing_sentence_hashes):
     """
     Process a single file:
       - Compute its hash.
       - Extract text and split into sentences.
-      - For each sentence, compute the embedding.
-    Returns a list of dictionaries (one per sentence) with file info and embedding.
+      - Batch compute embeddings for new sentences.
+    Returns a list of dictionaries with file info and embeddings.
     """
     file_path = os.path.join(pdf_dir, file)
     file_hash = compute_file_hash(file_path)
     text = extract_clean_text(file_path, tika_url)
     if not text:
         return []
+    
+    nlp = get_nlp()
     sentences = split_into_sentences(text, nlp)
+    
+    new_sentences = []
     results = []
     for sentence in sentences:
-        if sentence:
-            embedding = model.encode(f"passage: {sentence}", normalize_embeddings=True)
-            results.append({
-                "file": file,
-                "file_hash": file_hash,
-                "sentence": sentence,
-                "length": len(sentence),
-                "embedding": embedding.tolist()  # temporary, for caching; not saved in final metadata
-            })
+        sent_hash = compute_sentence_hash(sentence)
+        if sent_hash in existing_sentence_hashes:
+            continue
+        new_sentences.append(sentence)
+        results.append({
+            "file": file,
+            "file_hash": file_hash,
+            "sentence": sentence,
+            "length": len(sentence),
+            "sentence_hash": sent_hash  # used for deduplication
+        })
+    
+    # Batch embed new sentences
+    if new_sentences:
+        passages = [f"passage: {s}" for s in new_sentences]
+        embeddings = model.encode(passages, normalize_embeddings=True)
+        for idx, emb in enumerate(embeddings):
+            results[idx]["embedding"] = emb.tolist()
+    else:
+        results = []
+    
     return results
 
 # -----------------------------
@@ -80,12 +145,11 @@ def load_existing_metadata(metadata_file):
     return []
 
 # -----------------------------
-def process_all_files(pdf_dir, model, tika_url="http://localhost:9998/rmeta/text", metadata_file="faiss_metadata.json"):
+def process_all_files(pdf_dir, model, tika_url, metadata_file):
     """
-    Process files concurrently and do incremental updates.
-    Loads existing metadata and builds a set of processed file hashes.
-    Only processes files that are new or updated.
-    Returns a list of new sentence entries (including embedding vectors).
+    Process files concurrently using threads and perform incremental indexing.
+    Only processes new or updated sentences.
+    Returns a list of new sentence entries (with embeddings).
     """
     supported_exts = ('.pdf', '.doc', '.docx', '.pptx', '.txt')
     files = [f for f in os.listdir(pdf_dir) if f.lower().endswith(supported_exts)]
@@ -94,44 +158,33 @@ def process_all_files(pdf_dir, model, tika_url="http://localhost:9998/rmeta/text
         print("📂 No supported files found.")
         return []
     
-    # Load existing metadata and get processed file hashes
     existing_metadata = load_existing_metadata(metadata_file)
-    processed_hashes = {entry["file_hash"] for entry in existing_metadata}
+    processed_sentence_hashes = {entry.get("sentence_hash") for entry in existing_metadata if entry.get("sentence_hash")}
     
-    nlp = spacy.load("en_core_web_sm")
     new_results = []
-    
-    # Process files in parallel
+    # Use ThreadPoolExecutor to ensure the model is loaded only once.
     with ThreadPoolExecutor() as executor:
-        futures = [executor.submit(process_file, file, pdf_dir, nlp, model, tika_url) for file in files]
+        futures = [executor.submit(process_file, file, pdf_dir, model, tika_url, processed_sentence_hashes) for file in files]
         for future in tqdm(futures, desc="🔁 Processing Files"):
             file_results = future.result()
-            # Check the file hash in the first entry (if any)
             if file_results:
-                file_hash = file_results[0].get("file_hash")
-                if file_hash in processed_hashes:
-                    # Skip this file if already processed.
-                    continue
                 new_results.extend(file_results)
     return new_results
 
 # -----------------------------
-def build_incremental_index(new_results, model, index_file="faiss.index", metadata_file="faiss_metadata.json"):
+def build_incremental_index(new_results, model, index_file, metadata_file):
     """
     Build or update the FAISS index with new_results.
-    new_results should have an "embedding" key containing the embedding vector.
-    Existing metadata is loaded and new_results are appended.
-    The embeddings from new_results are added to the FAISS index.
+    Loads existing metadata and appends new results.
+    Embeddings from new_results are added to the FAISS index.
     """
-    # Load existing metadata if available.
     existing_metadata = load_existing_metadata(metadata_file)
     all_metadata = existing_metadata.copy()
     
-    # Determine embedding dimension using model on a sample text.
+    # Determine embedding dimension using a sample text.
     sample_vec = model.encode("example", normalize_embeddings=True)
     dim = sample_vec.shape[0]
     
-    # If index file exists, load it; otherwise create a new one.
     if os.path.exists(index_file):
         index = faiss.read_index(index_file)
     else:
@@ -141,7 +194,6 @@ def build_incremental_index(new_results, model, index_file="faiss.index", metada
     for item in new_results:
         vec = np.array(item["embedding"]).astype("float32")
         new_vectors.append(vec)
-        # Remove embedding from metadata before saving.
         item.pop("embedding", None)
         all_metadata.append(item)
     
@@ -153,38 +205,54 @@ def build_incremental_index(new_results, model, index_file="faiss.index", metada
             json.dump(all_metadata, f, indent=2, ensure_ascii=False)
         print(f"\n✅ Indexed {len(new_vectors)} new sentences. Updated FAISS index and metadata.")
     else:
-        print("\n✅ No new files to process. Index remains unchanged.")
+        print("\n✅ No new sentences to process. Index remains unchanged.")
 
 # -----------------------------
-def search(query, model, index_file="faiss.index", metadata_file="faiss_metadata.json", top_k=5):
+def search(query, model, index_file, metadata_file, top_k=5):
     query_vec = model.encode(f"query: {query}", normalize_embeddings=True).astype("float32")
     index = faiss.read_index(index_file)
+    
     with open(metadata_file, "r", encoding="utf-8") as f:
         metadata = json.load(f)
-    # Using L2 distance index (IndexFlatL2): lower distance means better match.
+    
     distances, indices = index.search(np.array([query_vec]), top_k)
     print(f"\n🔍 Top {top_k} results for query: '{query}'\n")
     for i, idx in enumerate(indices[0]):
-        print(f"{i+1}. {metadata[idx]['sentence']} (File: {metadata[idx]['file']}), Distance: {distances[0][i]:.3f}")
+        result = metadata[idx]
+        justification = generate_justification(query, result["sentence"])
+        print(f"{i+1}.  (File: {result['file']}), Distance: {distances[0][i]:.3f}")
+        print(f"   💬 Justification: {justification}\n")
 
 # -----------------------------
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Incremental FAISS-based Resume Search Engine")
+    parser.add_argument("--pdf_dir", type=str, default="resumes", help="Directory containing resume files")
+    parser.add_argument("--tika_url", type=str, default="http://localhost:9998/rmeta/text", help="Tika endpoint URL")
+    parser.add_argument("--index_file", type=str, default="faiss.index", help="FAISS index file")
+    parser.add_argument("--metadata_file", type=str, default="faiss_metadata.json", help="Metadata mapping file")
+    parser.add_argument("--rebuild", action="store_true", help="Rebuild the FAISS index from scratch")
+    args = parser.parse_args()
+    
+    # Optionally rebuild index and metadata files
+    if args.rebuild:
+        if os.path.exists(args.index_file):
+            os.remove(args.index_file)
+        if os.path.exists(args.metadata_file):
+            os.remove(args.metadata_file)
+        print("🔄 Rebuild selected: existing index and metadata removed.")
+    
+    # Initialize the E5-large model for embeddings.
     model = SentenceTransformer("intfloat/e5-large")
     
-    pdf_directory = "resumes"                      # Folder with your documents
-    tika_url = "http://localhost:9998/rmeta/text"  # Tika endpoint
-    index_file = "faiss.index"                     # FAISS index file
-    metadata_file = "faiss_metadata.json"          # Metadata mapping file
-
-    # Process files and get new sentence results (skip already processed files)
-    new_results = process_all_files(pdf_directory, model, tika_url, metadata_file)
+    # Process files and get new sentence results (skipping cached sentences)
+    new_results = process_all_files(args.pdf_dir, model, args.tika_url, args.metadata_file)
     
     # Build (or update) the FAISS index incrementally
-    build_incremental_index(new_results, model, index_file, metadata_file)
+    build_incremental_index(new_results, model, args.index_file, args.metadata_file)
     
-    # Query loop:
+    # Interactive query loop
     while True:
         query = input("\n🔎 Enter a search query (or 'exit' to quit): ").strip()
         if query.lower() == "exit":
             break
-        search(query, model, index_file, metadata_file, top_k=5)
+        search(query, model, args.index_file, args.metadata_file, top_k=5)
