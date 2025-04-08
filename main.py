@@ -189,27 +189,29 @@ def update_metadata_with_tfidf(metadata):
     return metadata
 
 # -----------------------------
-def aggregated_search_tfidf(query, model, index_file, metadata_file, top_k_sentences=50, top_k_resumes=5):
+def aggregated_search_tfidf(query, model, index_file, metadata_file, top_k_sentences=100, top_k_resumes=10):
     """
-    Aggregated search with TF-IDF weighting.
-    For each sentence retrieved by FAISS, the base similarity score (1/(1+distance))
-    is multiplied by its TF-IDF weight.
+    Aggregated search with normalization by total TF-IDF sum per resume.
+    The similarity score is weighted by TF-IDF and normalized by the total TF-IDF sum
+    of the contributing sentences for each resume.
     """
     try:
         # Encode the query
         query_vec = model.encode(f"query: {query}", normalize_embeddings=True).astype("float32")
         index = faiss.read_index(index_file)
-        
+
         # Load and update metadata with TF-IDF weights
         with open(metadata_file, "r", encoding="utf-8") as f:
             metadata = json.load(f)
         metadata = update_metadata_with_tfidf(metadata)
-        
+
         # Retrieve top sentences
         distances, indices = index.search(np.array([query_vec]), top_k_sentences)
-        
+
         # Aggregate weighted similarity scores by resume file
         resume_scores = {}
+        tfidf_sums = {}
+
         for dist, idx in zip(distances[0], indices[0]):
             if idx < 0 or idx >= len(metadata):
                 continue
@@ -218,14 +220,22 @@ def aggregated_search_tfidf(query, model, index_file, metadata_file, top_k_sente
             base_similarity = 1 / (1 + dist)
             tfidf_weight = item.get("tfidf_weight", 1.0)
             weighted_similarity = base_similarity * tfidf_weight
+
             resume_scores[file] = resume_scores.get(file, 0.0) + weighted_similarity
-        
-        # Sort resumes by aggregated weighted similarity score
-        sorted_resumes = sorted(resume_scores.items(), key=lambda x: x[1], reverse=True)
-        
-        print(f"\n🔍 Aggregated TF-IDF weighted search results for query: '{query}'\n")
+            tfidf_sums[file] = tfidf_sums.get(file, 0.0) + tfidf_weight
+
+        # Normalize aggregated scores by TF-IDF sum for each resume
+        normalized_scores = {
+            file: score / tfidf_sums[file]
+            for file, score in resume_scores.items() if tfidf_sums[file] > 0
+        }
+
+        # Sort resumes by normalized score
+        sorted_resumes = sorted(normalized_scores.items(), key=lambda x: x[1], reverse=True)
+
+        print(f"\n🔍 Normalized Aggregated TF-IDF weighted search results for query: '{query}'\n")
         for rank, (file, score) in enumerate(sorted_resumes[:top_k_resumes], start=1):
-            print(f"{rank}. Resume File: {file} - Aggregated Weighted Score: {score:.3f}")
+            print(f"{rank}. Resume File: {file} - Normalized Score: {score:.3f}")
     except Exception as e:
         print(f"❌ Error during search: {e}")
 
