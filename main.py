@@ -21,7 +21,7 @@ def get_nlp():
     return nlp_model
 
 # -----------------------------
-# Helper: Compute MD5 hash of a file
+# Compute MD5 hash for a file (to detect changes)
 def compute_file_hash(file_path):
     hash_md5 = hashlib.md5()
     try:
@@ -33,11 +33,12 @@ def compute_file_hash(file_path):
     return hash_md5.hexdigest()
 
 # -----------------------------
-# Compute MD5 hash for a sentence to avoid re-embedding duplicates
+# Compute MD5 hash for a sentence (to avoid re-embedding duplicates)
 def compute_sentence_hash(sentence):
     return hashlib.md5(sentence.encode("utf-8")).hexdigest()
 
 # -----------------------------
+# Extract text from document using Tika server
 def extract_clean_text(file_path, tika_url="http://localhost:9998/rmeta/text"):
     try:
         with open(file_path, "rb") as f:
@@ -52,23 +53,19 @@ def extract_clean_text(file_path, tika_url="http://localhost:9998/rmeta/text"):
     return ""
 
 # -----------------------------
+# Clean up individual sentence strings
 def clean_sentence(sentence):
     return sentence.replace('\n\n', ' ').replace('\n', ' ').replace('', '').strip()
 
 # -----------------------------
+# Split text into sentences using spaCy
 def split_into_sentences(text, nlp):
     doc = nlp(text)
-    return [clean_sentence(sent.text) for sent in doc.sents if sent.text.strip() and len(sent.text.strip()) > 5]
+    return [clean_sentence(sent.text).strip() for sent in doc.sents if sent.text.strip() and len(sent.text.strip()) > 5]
 
 # -----------------------------
+# Process a single file: extract text, split into sentences, batch compute embeddings.
 def process_file(file, pdf_dir, model, tika_url, existing_sentence_hashes):
-    """
-    Process a single file:
-      - Compute its hash.
-      - Extract text and split into sentences.
-      - Batch compute embeddings for new sentences.
-    Returns a list of dictionaries with file info and embeddings.
-    """
     file_path = os.path.join(pdf_dir, file)
     file_hash = compute_file_hash(file_path)
     text = extract_clean_text(file_path, tika_url)
@@ -90,10 +87,9 @@ def process_file(file, pdf_dir, model, tika_url, existing_sentence_hashes):
             "file_hash": file_hash,
             "sentence": sentence,
             "length": len(sentence),
-            "sentence_hash": sent_hash  # used for deduplication
+            "sentence_hash": sent_hash
         })
     
-    # Batch embed new sentences
     if new_sentences:
         passages = [f"passage: {s}" for s in new_sentences]
         embeddings = model.encode(passages, normalize_embeddings=True)
@@ -105,6 +101,7 @@ def process_file(file, pdf_dir, model, tika_url, existing_sentence_hashes):
     return results
 
 # -----------------------------
+# Load existing metadata from a JSON file, if available.
 def load_existing_metadata(metadata_file):
     if os.path.exists(metadata_file):
         with open(metadata_file, "r", encoding="utf-8") as f:
@@ -112,12 +109,8 @@ def load_existing_metadata(metadata_file):
     return []
 
 # -----------------------------
+# Process all files concurrently and generate new sentence entries
 def process_all_files(pdf_dir, model, tika_url, metadata_file):
-    """
-    Process files concurrently using threads and perform incremental indexing.
-    Only processes new or updated sentences.
-    Returns a list of new sentence entries (with embeddings).
-    """
     supported_exts = ('.pdf', '.doc', '.docx', '.pptx', '.txt')
     files = [f for f in os.listdir(pdf_dir) if f.lower().endswith(supported_exts)]
     
@@ -138,29 +131,23 @@ def process_all_files(pdf_dir, model, tika_url, metadata_file):
     return new_results
 
 # -----------------------------
+# Build or update the FAISS index incrementally
 def build_incremental_index(new_results, model, index_file, metadata_file):
-    """
-    Build or update the FAISS index with new_results.
-    Loads existing metadata and appends new results.
-    Embeddings from new_results are added to the FAISS index.
-    """
     existing_metadata = load_existing_metadata(metadata_file)
     all_metadata = existing_metadata.copy()
     
-    # Determine embedding dimension using a sample text.
     sample_vec = model.encode("example", normalize_embeddings=True)
     dim = sample_vec.shape[0]
     
     if os.path.exists(index_file):
         index = faiss.read_index(index_file)
     else:
-        index = faiss.IndexFlatL2(dim)
+        index = faiss.IndexFlatIP(dim)
     
     new_vectors = []
     for item in new_results:
         vec = np.array(item["embedding"]).astype("float32")
         new_vectors.append(vec)
-        # Remove the embedding field from metadata before saving
         item.pop("embedding", None)
         all_metadata.append(item)
     
@@ -175,42 +162,59 @@ def build_incremental_index(new_results, model, index_file, metadata_file):
         print("\n✅ No new sentences to process. Index remains unchanged.")
 
 # -----------------------------
+# Update each metadata entry with TF-IDF weight from its sentence content
 def update_metadata_with_tfidf(metadata):
-    """
-    Compute a TF-IDF weight for each sentence and update metadata.
-    Here, the weight is computed as the sum of TF-IDF scores for all words in the sentence.
-    """
     sentences = [entry["sentence"] for entry in metadata]
     vectorizer = TfidfVectorizer()
     tfidf_matrix = vectorizer.fit_transform(sentences)
-    tfidf_weights = tfidf_matrix.sum(axis=1).A1  # flatten to 1D array
+    tfidf_weights = tfidf_matrix.sum(axis=1).A1
     for entry, weight in zip(metadata, tfidf_weights):
         entry["tfidf_weight"] = weight
     return metadata
 
 # -----------------------------
-def aggregated_search_tfidf(query, model, index_file, metadata_file, top_k_sentences=100, top_k_resumes=10):
-    """
-    Aggregated search with normalization by total TF-IDF sum per resume.
-    The similarity score is weighted by TF-IDF and normalized by the total TF-IDF sum
-    of the contributing sentences for each resume.
-    """
+# Google LLM text generation using Gemini-2.0-Flash (for justifications)
+def google_text_generation(prompt, api_key, 
+                           endpoint="https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+                           temperature=0.2, max_output_tokens=256):
+    payload = {
+        "contents": [{
+            "parts": [{"text": prompt}]
+        }],
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": max_output_tokens,
+            "topP": 0.95
+        }
+    }
+    headers = {"Content-Type": "application/json"}
+    params = {"key": api_key}
+
     try:
-        # Encode the query
+        response = requests.post(endpoint, headers=headers, params=params, data=json.dumps(payload))
+        response.raise_for_status()
+        result = response.json()
+        return result["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        print(f"❌ Error during Google LLM text generation: {e}")
+        return ""
+
+# -----------------------------
+# Aggregated search: retrieves top resumes and generates resume-specific justification
+def aggregated_search_tfidf(query, model, index_file, metadata_file, top_k_sentences=100, top_k_resumes=5, api_key=""):
+    try:
         query_vec = model.encode(f"query: {query}", normalize_embeddings=True).astype("float32")
         index = faiss.read_index(index_file)
 
-        # Load and update metadata with TF-IDF weights
         with open(metadata_file, "r", encoding="utf-8") as f:
             metadata = json.load(f)
         metadata = update_metadata_with_tfidf(metadata)
 
-        # Retrieve top sentences
         distances, indices = index.search(np.array([query_vec]), top_k_sentences)
 
-        # Aggregate weighted similarity scores by resume file
         resume_scores = {}
         tfidf_sums = {}
+        resume_sentences = {}
 
         for dist, idx in zip(distances[0], indices[0]):
             if idx < 0 or idx >= len(metadata):
@@ -223,33 +227,52 @@ def aggregated_search_tfidf(query, model, index_file, metadata_file, top_k_sente
 
             resume_scores[file] = resume_scores.get(file, 0.0) + weighted_similarity
             tfidf_sums[file] = tfidf_sums.get(file, 0.0) + tfidf_weight
+            resume_sentences.setdefault(file, []).append(item["sentence"])
 
-        # Normalize aggregated scores by TF-IDF sum for each resume
         normalized_scores = {
             file: score / tfidf_sums[file]
             for file, score in resume_scores.items() if tfidf_sums[file] > 0
         }
 
-        # Sort resumes by normalized score
         sorted_resumes = sorted(normalized_scores.items(), key=lambda x: x[1], reverse=True)
 
-        print(f"\n🔍 Normalized Aggregated TF-IDF weighted search results for query: '{query}'\n")
+        print(f"\n🔍 Search results for query: '{query}'\n")
         for rank, (file, score) in enumerate(sorted_resumes[:top_k_resumes], start=1):
             print(f"{rank}. Resume File: {file} - Normalized Score: {score:.3f}")
+
+            # Generate resume-specific justification if API key provided
+            if api_key:
+                # Select up to 5 top matching sentences
+                top_sentences = resume_sentences.get(file, [])[:5]
+                bullet_points = "\n".join([f"- {s}" for s in top_sentences])
+                prompt = (
+                    f"Below are selected key sentences extracted from this candidate's resume:\n{bullet_points}\n\n"
+                    f"Based on these specific details, explain why the candidate is a good match for the job requirement: '{query}'. "
+                    f"Focus on the unique skills and experiences mentioned."
+                )
+                justification = google_text_generation(prompt, api_key)
+                print(f"🧠 Justification:\n{justification.strip()}\n")
+            else:
+                print("⚠️  Google API key not provided. Skipping justification.\n")
     except Exception as e:
         print(f"❌ Error during search: {e}")
 
 # -----------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Incremental FAISS-based Resume Search Engine with TF-IDF weighting")
+    parser = argparse.ArgumentParser(
+        description="Incremental FAISS-based Resume Search Engine with TF-IDF weighting and Google LLM integration for resume-specific justifications"
+    )
     parser.add_argument("--pdf_dir", type=str, default="resumes", help="Directory containing resume files")
     parser.add_argument("--tika_url", type=str, default="http://localhost:9998/rmeta/text", help="Tika endpoint URL")
     parser.add_argument("--index_file", type=str, default="faiss.index", help="FAISS index file")
     parser.add_argument("--metadata_file", type=str, default="faiss_metadata.json", help="Metadata mapping file")
     parser.add_argument("--rebuild", action="store_true", help="Rebuild the FAISS index from scratch")
+    parser.add_argument("--google_api_key", type=str, default="", help="Google API key for text generation")
     args = parser.parse_args()
     
-    # Optionally rebuild index and metadata files
+    # Optionally, you can hardcode your API key for testing (not recommended for production)
+    # args.google_api_key = "YOUR_GOOGLE_API_KEY"
+    
     if args.rebuild:
         if os.path.exists(args.index_file):
             os.remove(args.index_file)
@@ -257,18 +280,39 @@ if __name__ == "__main__":
             os.remove(args.metadata_file)
         print("🔄 Rebuild selected: existing index and metadata removed.")
     
-    # Initialize the E5-large model for embeddings.
+    # Initialize the SentenceTransformer model for embeddings.
     model = SentenceTransformer("intfloat/e5-large")
     
-    # Process files and get new sentence results (skipping cached sentences)
+    # Process files and extract new sentences (skipping already embedded ones)
     new_results = process_all_files(args.pdf_dir, model, args.tika_url, args.metadata_file)
     
     # Build (or update) the FAISS index incrementally
     build_incremental_index(new_results, model, args.index_file, args.metadata_file)
     
-    # Interactive query loop using TF-IDF weighted aggregated search
+    # Interactive loop for search queries and justification generation
+    print("\nEnter a search query to search resumes, or type 'gen:' for direct text generation.")
     while True:
-        query = input("\n🔎 Enter a search query (or 'exit' to quit): ").strip()
+        query = input("\n🔎 Enter a query (or 'exit' to quit): ").strip()
         if query.lower() == "exit":
             break
-        aggregated_search_tfidf(query, model, args.index_file, args.metadata_file, top_k_sentences=50, top_k_resumes=5)
+        
+        # Direct generation mode with "gen:" prefix
+        if query.lower().startswith("gen:"):
+            prompt = query[4:].strip()
+            if not args.google_api_key:
+                print("❌ Google API key not provided. Use the --google_api_key argument.")
+            else:
+                generated_text = google_text_generation(prompt, args.google_api_key)
+                print("\n🤖 Generated Text:\n" + generated_text)
+            continue
+        
+        # Otherwise perform aggregated TF-IDF search with resume-specific justifications.
+        aggregated_search_tfidf(
+            query, 
+            model, 
+            args.index_file, 
+            args.metadata_file, 
+            top_k_sentences=50, 
+            top_k_resumes=5, 
+            api_key=args.google_api_key
+        )
